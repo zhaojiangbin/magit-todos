@@ -247,9 +247,22 @@ order. "
                              (t (error "magit-todos: Unable to find rg, ag, or a grep command that supports the --perl-regexp option")))))
          (set-default option value)))
 
-(defcustom magit-todos-max-items 20
+(defcustom magit-todos-max-items 10
   "Automatically collapse the section if there are more than this many items."
   :type 'integer)
+
+(defcustom magit-todos-auto-group-items 20
+  "Whether or when to automatically group items."
+  :type '(choice (integer :tag "When there are N or more items")
+                 (const :tag "Always" always)
+                 (const :tag "Never" never)))
+
+(defcustom magit-todos-group-by '(magit-todos-item-keyword magit-todos-item-filename)
+  "How to group items.
+One or more attributes may be chosen, and they will be grouped in
+order."
+  :type '(repeat (choice (const :tag "By filename" magit-todos-item-filename)
+                         (const :tag "By keyword" magit-todos-item-keyword))))
 
 (defcustom magit-todos-recursive nil
   "Recurse into subdirectories when looking for to-do items.
@@ -405,49 +418,97 @@ This function should be called from inside a ‘magit-status’ buffer."
 (defun magit-todos--insert-items-callback (magit-status-buffer items)
   "Insert to-do ITEMS into MAGIT-STATUS-BUFFER."
   (declare (indent defun))
-  (setq items (magit-todos--sort items))
-  (if (not (buffer-live-p magit-status-buffer))
-      (message "`magit-todos--insert-items-callback': Callback called for deleted buffer")
-    ;; NOTE: This could be factored out into some kind of `magit-insert-section-async' macro if necessary.
-    (with-current-buffer magit-status-buffer
-      (when-let ((magit-section-show-child-count t)
-                 (inhibit-read-only t)
-                 ;; HACK: "For internal use only."  But this makes collapsing the new section work!
-                 (magit-insert-section--parent magit-root-section)
-                 (width (window-text-width)))
-        (save-excursion
-          (goto-char (point-min))
-          (pcase magit-todos-insert-at
-            ;; Go to insertion position
-            ('top (cl-loop for ((this-section . _) . _) = (magit-section-ident (magit-current-section))
-                           until (not (member this-section '(branch tags)))
-                           do (magit-section-forward)))
-            ('bottom (goto-char (point-max)))
-            (_ (magit-todos--skip-section (vector '* magit-todos-insert-at))))
-          ;; Insert section
-          (let ((section (magit-insert-section (todos)
-                           (magit-insert-heading "TODOs:")
-                           (dolist (item items)
-                             (let* ((filename (propertize (magit-todos-item-filename item) 'face 'magit-filename))
-                                    (string (--> (concat filename " "
-                                                         (funcall (if (s-suffix? ".org" filename)
-                                                                      #'magit-todos--format-org
-                                                                    #'magit-todos--format-plain)
-                                                                  item))
-                                                 (truncate-string-to-width it width))))
-                               (magit-insert-section (todo item)
-                                 (insert string)))
-                             (insert "\n"))
-                           (insert "\n"))))
-            ;; Set section visibility
-            (pcase (magit-section-cached-visibility section)
-              ('hide (magit-section-hide section))
-              ('show (magit-section-show section))
-              (_ (if (> (length items) magit-todos-max-items)
-                     ;; HACK: We have to do this manually because the set-visibility-hook doesn't work.
-                     (magit-section-hide section)
-                   ;; Not hidden: set slot manually (necessary for some reason)
-                   (oset section hidden nil))))))))))
+  (let ((num-items (length items)))
+    (if (not (buffer-live-p magit-status-buffer))
+        (message "`magit-todos--insert-items-callback': Callback called for deleted buffer")
+      ;; NOTE: This could be factored out into some kind of `magit-insert-section-async' macro if necessary.
+      ;; TODO: Put filename in item format when not grouping.
+      (cl-labels ((set-visibility (section)
+                                  (progn (pcase (magit-section-cached-visibility section)
+                                           ('hide (magit-section-hide section))
+                                           ('show (magit-section-show section))
+                                           (_ (if (> (length items) magit-todos-max-items)
+                                                  ;; HACK: We have to do this manually because the set-visibility-hook doesn't work.
+                                                  (magit-section-hide section)
+                                                ;; Not hidden: set slot manually (necessary for some reason)
+                                                (magit-section-show section)
+                                                ;; (oset section hidden nil)
+                                                )))
+                                         section))
+                  (insert-group (&key type depth heading fns items)
+                                (if (and (consp fns)
+                                         (> (length fns) 0))
+                                    ;; FIXME: Visibility caching doesn't work :( It seems that the
+                                    ;; `magit-section-visibility-cache' variable gets filled with
+                                    ;; extra entries with incorrect visibility states, and then
+                                    ;; `alist-get' gets the wrong value.
+                                    (set-visibility (magit-insert-section ((eval type))
+                                                      (magit-insert-heading (concat (s-repeat depth " ") heading))
+                                                      (cl-loop for (group-type . items) in (-group-by (car fns) items)
+                                                               do (insert-group :depth (+ 2 depth)
+                                                                                :type (make-symbol group-type)
+                                                                                :heading (concat group-type
+                                                                                                 (if (= 1 (length fns))
+                                                                                                     ":"
+                                                                                                   (concat " " (format "(%s)" (length items)))))
+                                                                                :fns (cdr fns)
+                                                                                :items items))))
+                                  (let* ((heading (concat (s-repeat depth " ") heading))
+                                         (width (window-text-width)))
+                                    (set-visibility (magit-insert-section ((eval type))
+                                                      (magit-insert-heading heading)
+                                                      (dolist (item items)
+                                                        (let* ((filename (propertize (magit-todos-item-filename item) 'face 'magit-filename))
+                                                               (string (--> (concat (s-repeat depth " ")
+                                                                                    (funcall (if (s-suffix? ".org" filename)
+                                                                                                 #'magit-todos--format-org
+                                                                                               #'magit-todos--format-plain)
+                                                                                             item))
+                                                                            (truncate-string-to-width it (- width depth)))))
+                                                          (magit-insert-section (todo item)
+                                                            (insert (s-repeat depth " ") string))
+                                                          (insert "\n")))))))))
+        (with-current-buffer magit-status-buffer
+          (when-let ((magit-section-show-child-count t)
+                     (inhibit-read-only t)
+                     ;; HACK: "For internal use only."  But this makes collapsing the new section work!
+                     (magit-insert-section--parent magit-root-section)
+                     ;; (magit-section-set-visibility-hook '(magit-section-cached-visibility))
+                     (width (window-text-width)))
+            (save-excursion
+              (goto-char (point-min))
+              (pcase magit-todos-insert-at
+                ;; Go to insertion position
+                ('top (cl-loop for ((this-section . _) . _) = (magit-section-ident (magit-current-section))
+                               until (not (member this-section '(branch tags)))
+                               do (magit-section-forward)))
+                ('bottom (goto-char (point-max)))
+                (_ (magit-todos--skip-section (vector '* magit-todos-insert-at))))
+              ;; Insert section
+              (let* ((grouping-fns (pcase magit-todos-auto-group-items
+                                     ('never nil)
+                                     ('always magit-todos-group-by)
+                                     ((pred integerp) (when (> num-items magit-todos-auto-group-items)
+                                                        magit-todos-group-by))
+                                     (_ (error "Invalid value for magit-todos-auto-group-items"))))
+                     (section (insert-group :depth 0
+                                            :heading (format "TODOs (%s)" num-items)
+                                            :type 'todos
+                                            :fns grouping-fns
+                                            :items items)))
+                (insert "\n")
+                ;; (goto-char (oref section end))
+                ;; (magit-section-backward)
+                ;; (cl-loop until (not (magit-section-match [* todos]))
+                ;;          do (progn
+                ;;               (message (pp-to-string (a-list 'section (magit-section-ident (magit-current-section))
+                ;;                                              'cached-visibility (magit-section-cached-visibility (magit-current-section)))))
+                ;;               (unless (magit-section-match [* todo])
+                ;;                 (set-visibility (magit-current-section)))
+                ;;               (condition-case nil
+                ;;                   (magit-section-backward)
+                ;;                 (error (cl-return)))))
+                ))))))))
 
 (defun magit-todos--skip-section (condition)
   "Move past the section matching CONDITION.
