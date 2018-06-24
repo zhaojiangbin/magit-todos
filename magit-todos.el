@@ -127,6 +127,10 @@ This should be set automatically by customizing
     (define-key m [remap magit-visit-thing] #'magit-todos--goto-item)
     m))
 
+(defvar-local magit-todos-show-filenames nil
+  "Whether to show filenames next to to-do items.
+Set automatically depending on grouping.")
+
 ;;;; Customization
 
 (defgroup magit-todos nil
@@ -422,19 +426,19 @@ This function should be called from inside a ‘magit-status’ buffer."
   ;; TODO: Put filename in item format when not grouping.
   (when (not (buffer-live-p magit-status-buffer))
     (error "`magit-todos--insert-items-callback': Callback called for deleted buffer"))
-  (let* ((num-items (length items))
-         (grouping-fns (pcase magit-todos-auto-group-items
-                         ('never nil)
-                         ('always magit-todos-group-by)
-                         ((pred integerp) (when (> num-items magit-todos-auto-group-items)
-                                            magit-todos-group-by))
-                         (_ (error "Invalid value for magit-todos-auto-group-items"))))
-         (magit-todos-show-filenames (not (member 'magit-todos-item-filename grouping-fns)))
+  (let* ((items (magit-todos--sort items))
+         (num-items (length items))
+         (group-fns (pcase magit-todos-auto-group-items
+                      ('never nil)
+                      ('always magit-todos-group-by)
+                      ((pred integerp) (when (> num-items magit-todos-auto-group-items)
+                                         magit-todos-group-by))
+                      (_ (error "Invalid value for magit-todos-auto-group-items"))))
+         (magit-todos-show-filenames (not (member 'magit-todos-item-filename group-fns)))
          (magit-section-show-child-count t)
          ;; HACK: "For internal use only."  But this makes collapsing the new section work!
          (magit-insert-section--parent magit-root-section)
-         (inhibit-read-only t)
-         section)
+         (inhibit-read-only t))
     (with-current-buffer magit-status-buffer
       (save-excursion
         (goto-char (point-min))
@@ -446,65 +450,99 @@ This function should be called from inside a ‘magit-status’ buffer."
           ('bottom (goto-char (point-max)))
           (_ (magit-todos--skip-section (vector '* magit-todos-insert-at))))
         ;; Insert section
-        (setq section (magit-todos--insert-group :depth 0
-                                                 :heading (format "TODOs (%s)" num-items)
-                                                 :type 'todos
-                                                 :fns grouping-fns
-                                                 :items items))
-        (insert "\n")
-        ;; Set section visibility
-        (pcase (magit-section-cached-visibility section)
-          ('hide (magit-section-hide section))
-          ('show (magit-section-show section))
-          (_ (if (> (length items) magit-todos-max-items)
-                 ;; HACK: We have to do this manually because the set-visibility-hook doesn't work.
-                 (magit-section-hide section)
-               ;; Not hidden: set slot manually (necessary for some reason)
-               (magit-section-show section))))))))
+        (aprog1
+            (magit-todos--insert-group :type 'todos
+              :heading (format "TODOs (%s)" num-items)
+              :group-fns group-fns
+              :items items
+              :depth 0)
+          (insert "\n")
+          (magit-todos--set-visibility :section it :num-items num-items))))))
 
-(cl-defun magit-todos--insert-group (&key type depth heading fns items)
-  "FIXME: Docstring"
+(cl-defun magit-todos--insert-group (&key depth group-fns heading type items)
+  "Insert grouped ITEMS into Magit section and return the section.
+
+DEPTH sets indentation and should be 0 for a top-level group,
+increasing by 1 for each hierarchical level.
+
+GROUP-FNS may be a list of functions to which ITEMS are applied
+with `-group-by' to group them.  Items are grouped
+hierarchically, i.e. when GROUP-FNS has more than one function,
+items are first grouped by the first function, then subgroups are
+created which group items by subsequent functions.
+
+HEADING is a string which is the group's heading.  If GROUP-FNS
+has only one function, a colon is appended, causing Magit to
+automatically append the number of ITEMS.
+
+TYPE is a symbol which is used by Magit internally to identify sections."
   ;; FIXME: Visibility caching doesn't work :( It seems that the `magit-section-visibility-cache'
   ;; variable gets filled with extra entries with incorrect visibility states, and then `alist-get'
   ;; gets the wrong value.  Need to see if that happens when magit-todos-mode is off.
+  (declare (indent defun))
   (let* ((indent (s-repeat depth " "))
          (heading (concat indent heading))
          (magit-insert-section--parent (if (= 0 depth)
                                            magit-root-section
                                          magit-insert-section--parent)))
-    (if (and (consp fns)
-             (> (length fns) 0))
+    (if (and (consp group-fns)
+             (> (length group-fns) 0))
         ;; Insert more sections
-        (magit-insert-section ((eval type))
-          (magit-insert-heading heading)
-          (cl-loop for (group-type . items) in (-group-by (car fns) items)
-                   do (magit-todos--insert-group :depth (+ 2 depth)
-                                                 :type (make-symbol group-type)
-                                                 :heading (concat group-type
-                                                                  (if (= 1 (length fns))
-                                                                      ":"
-                                                                    (concat " " (format "(%s)" (length items)))))
-                                                 :fns (cdr fns)
-                                                 :items items)))
+        (aprog1                         ; `aprog1' is really handy here.
+            (magit-insert-section ((eval type))
+              (magit-insert-heading heading)
+              (cl-loop for (group-type . items) in (-group-by (car group-fns) items)
+                       do (magit-todos--insert-group :type (make-symbol group-type)
+                            :heading (concat group-type
+                                             (if (= 1 (length group-fns))
+                                                 ":"
+                                               (concat " " (format "(%s)" (length items)))))
+                            :group-fns (cdr group-fns)
+                            :depth (+ 2 depth)
+                            :items items)))
+          (magit-todos--set-visibility :depth depth :num-items (length items) :section it))
       ;; Insert individual to-do items
       (let ((width (window-text-width)))
-        (magit-insert-section ((eval type))
-          (magit-insert-heading heading)
-          (dolist (item items)
-            (let* ((filename (propertize (magit-todos-item-filename item) 'face 'magit-filename))
-                   (string (--> (concat (s-repeat depth " ")
-                                        (when magit-todos-show-filenames
-                                          (concat filename " "))
-                                        (funcall (if (s-suffix? ".org" filename)
-                                                     #'magit-todos--format-org
-                                                   #'magit-todos--format-plain)
-                                                 item))
-                                (truncate-string-to-width it (- width depth)))))
-              (magit-insert-section (todo item)
-                (insert (s-repeat depth " ") string))
-              (insert "\n"))))))))
+        (aprog1
+            (magit-insert-section ((eval type))
+              (magit-insert-heading heading)
+              (dolist (item items)
+                (let* ((filename (propertize (magit-todos-item-filename item) 'face 'magit-filename))
+                       (string (--> (concat (s-repeat depth " ")
+                                            (when magit-todos-show-filenames
+                                              (concat filename " "))
+                                            (funcall (if (s-suffix? ".org" filename)
+                                                         #'magit-todos--format-org
+                                                       #'magit-todos--format-plain)
+                                                     item))
+                                    (truncate-string-to-width it (- width depth)))))
+                  (magit-insert-section (todo item)
+                    (insert (s-repeat depth " ") string))
+                  (insert "\n"))))
+          (magit-todos--set-visibility :depth depth :num-items (length items) :section it))))))
 
-(defvar-local magit-todos-show-filenames nil)
+(cl-defun magit-todos--set-visibility (&key section num-items depth)
+  "Set the visibility of SECTION.
+
+If the section's visibility is cached by Magit, the cached
+setting is applied.  Otherwise, visibility is set according to
+whether NUM-ITEMS is greater than `magit-todos-max-items'.
+
+When DEPTH is greater than 0, NUM-ITEMS is compared to
+`magit-todos-max-items' divided by DEPTH multiplied by 2,
+i.e. the max number of items which cause sections to be
+automatically hidden halves at each deeper level."
+  (declare (indent defun))
+  (pcase (magit-section-cached-visibility section)
+    ('hide (magit-section-hide section))
+    ('show (magit-section-show section))
+    (_ (if (> num-items (pcase depth
+                          (0 magit-todos-max-items)
+                          (_ (/ magit-todos-max-items (* depth 2)))))
+           ;; HACK: We have to do this manually because the set-visibility-hook doesn't work.
+           (magit-section-hide section)
+         ;; Not hidden: set slot manually (necessary for some reason)
+         (magit-section-show section)))))
 
 (defun magit-todos--skip-section (condition)
   "Move past the section matching CONDITION.
