@@ -75,7 +75,6 @@
 (require 'async)
 (require 'dash)
 (require 'f)
-(require 'hl-todo)
 (require 'magit)
 (require 'pcre2el)
 (require 's)
@@ -443,15 +442,26 @@ advance to the next line."
                              :keyword (match-string 4)
                              :description (match-string 5)))))
 
+(defface magit-todos-keyword-face
+  '((t (:inherit font-lock-warning-face)))
+  "Face used for highlighting keywords listed in section when not
+ using hl-todo.")
+
 (defun magit-todos--keyword-face (keyword)
   "Return face for KEYWORD."
   ;; TODO: Instead of upcasing here, upcase in the lookup, so it can still be displayed
   ;; non-uppercase.  Preserving the distinction might be useful.
   (when magit-todos-ignore-case
     (setq keyword (upcase keyword)))
-  (atypecase (a-get hl-todo-keyword-faces keyword)
-    (string (list :inherit 'hl-todo :foreground it))
-    (t it)))
+  ;; FIXME: Better way to determine hl-todo in use or not?  This also
+  ;; does not allow to specify keywords as list and still use hl-todo
+  ;; for font locking.
+  (if (and (symbolp magit-todos-keywords)
+           (eq magit-todos-keywords 'hl-todo-keyword-faces))
+      (atypecase (a-get hl-todo-keyword-faces keyword)
+        (string (list :inherit 'hl-todo :foreground it))
+        (t it))
+    'magit-todos-keyword-face))
 
 (defun magit-todos--fontify-like-in-org-mode (s &optional odd-levels)
   "Fontify string S like in Org-mode.
@@ -715,9 +725,11 @@ regular expression."
          (set-default option value)
          (let ((keywords (cl-typecase value
                            (null (user-error "Please add some keywords"))
-                           (symbol (if (a-associative-p (symbol-value value))
+                           (symbol (when (featurep 'hl-todo)
+                                     (require 'hl-todo)
+                                     (if (a-associative-p (symbol-value value))
                                        (mapcar #'car (symbol-value value))
-                                     (symbol-value value)))
+                                     (symbol-value value))))
                            (list value))))
            (setq magit-todos-keywords-list (seq-difference keywords magit-todos-ignored-keywords)))))
 
